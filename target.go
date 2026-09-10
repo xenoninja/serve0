@@ -47,6 +47,11 @@ func (p *previewPage) openPath(path string, links int) (*os.File, error) {
 		return nil, fmt.Errorf("too many page symlinks")
 	}
 	if filepath.IsAbs(path) {
+		// Preserve hidden components before Rel/Join can clean them away.
+		// Hidden ancestors of the preview directory are outside the policy.
+		if hiddenPath(strings.TrimPrefix(path, p.directory+string(filepath.Separator))) {
+			return nil, fmt.Errorf("hidden preview paths are not served")
+		}
 		var err error
 		path, err = filepath.Rel(p.directory, path)
 		if err != nil {
@@ -56,10 +61,8 @@ func (p *previewPage) openPath(path string, links int) (*os.File, error) {
 	if !filepath.IsLocal(path) {
 		return nil, fmt.Errorf("page is outside the preview directory")
 	}
-	for _, part := range strings.Split(path, string(filepath.Separator)) {
-		if strings.HasPrefix(part, ".") && part != "." && part != ".." {
-			return nil, fmt.Errorf("hidden preview pages are not served")
-		}
+	if hiddenPath(path) {
+		return nil, fmt.Errorf("hidden preview paths are not served")
 	}
 	parts := strings.Split(filepath.Clean(path), string(filepath.Separator))
 	current := p.root
@@ -74,10 +77,13 @@ func (p *previewPage) openPath(path string, links int) (*os.File, error) {
 				return nil, err
 			}
 			if !filepath.IsAbs(target) {
+				if hiddenPath(target) {
+					return nil, fmt.Errorf("hidden preview paths are not served")
+				}
 				target = filepath.Join(append(parts[:i], target)...)
 			}
 			if i+1 < len(parts) {
-				target = filepath.Join(append([]string{target}, parts[i+1:]...)...)
+				target += string(filepath.Separator) + filepath.Join(parts[i+1:]...)
 			}
 			return p.openPath(target, links+1)
 		}
@@ -112,4 +118,13 @@ func (p *previewPage) openPath(path string, links int) (*os.File, error) {
 		return f, nil
 	}
 	return nil, fmt.Errorf("page must be a regular file")
+}
+
+func hiddenPath(path string) bool {
+	for _, part := range strings.Split(path, string(filepath.Separator)) {
+		if strings.HasPrefix(part, ".") && part != "." && part != ".." {
+			return true
+		}
+	}
+	return false
 }

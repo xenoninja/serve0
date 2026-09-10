@@ -13,13 +13,20 @@ go build -o serve0 .
 
 Copy one of the printed candidate browser URLs. The root URL `/` serves the
 selected preview page, regardless of its filename. Refresh the browser to see
-saved edits. Other URL paths currently return 404; preview assets are not yet
-served.
+saved edits to HTML and preview assets without restarting. Responses use
+`Cache-Control: no-store` so an ordinary refresh fetches current contents.
+Adjacent and nested stylesheets, scripts, images, fonts, and other ordinary
+files are served with content types appropriate to their filenames.
 
 Relative page paths resolve from the invoking working directory. The containing
-directory is the preview directory. Hidden pages and links to hidden files or
-files outside that directory are rejected. A deleted, unreadable, non-regular,
-or disallowed replacement page returns 404 until a valid page is available again.
+directory is the preview directory, even when the command starts elsewhere.
+Every ordinary file beneath it is available by a known URL, including neighboring
+files the preview page does not reference. Use a dedicated preview directory to
+limit which files are exposed. Directory listings, dotfiles, and dot-directories
+are hidden. Links to hidden paths or files outside the preview directory are
+rejected, including replacements made while the command runs. Missing,
+unreadable, non-regular, or prohibited paths return 404; unknown routes never
+fall back to the preview page.
 
 The process stays in the foreground, including inside tmux or screen. Press
 Ctrl+C to stop it and release the port. Invalid arguments, inaccessible pages,
@@ -34,3 +41,13 @@ browser. The wildcard bind address is not a browser destination.
 Run the CLI/HTTP integration tests with `go test ./...` and static checks with
 `go vet ./...`. Tests build the executable, use temporary fixtures and dynamically
 allocated ports, and require permission to open local listening sockets.
+
+Confinement tests require symlink creation on each supported platform (Linux,
+macOS, and Windows); failures are reported rather than skipped. On Windows,
+enable Developer Mode or run the tests with permission to create symlinks.
+
+Browser refresh smoke check: create a preview page referencing a neighboring
+stylesheet and script, open its printed URL, then edit both its heading and the
+stylesheet's heading color. An ordinary browser refresh should show the new
+heading and color without restarting `serve0`. This was also exercised with
+headless Chrome using an ordinary reload with cache bypass disabled.

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -21,7 +22,8 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
-	binary = filepath.Join(dir, "serve0")
+	// Keep the executable discoverable through PATHEXT on Windows.
+	binary = filepath.Join(dir, "serve0.exe")
 	build := exec.Command("go", "build", "-o", binary, ".")
 	if output, err := build.CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", output, err)
@@ -44,6 +46,7 @@ func start(t *testing.T, dir string, args ...string) *preview {
 	t.Helper()
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = dir
+	preparePreviewProcess(cmd)
 	pipe, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -130,7 +133,7 @@ func TestPreviewLifecycle(t *testing.T) {
 	if !strings.HasPrefix(h.Get("Content-Type"), "text/html") {
 		t.Fatal(h)
 	}
-	get(t, p.urls[0]+"chosen.html", 404, "")
+	get(t, p.urls[0]+"chosen.html", 200, "")
 	if err := os.WriteFile(page, []byte("<h1>edited</h1>"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +141,7 @@ func TestPreviewLifecycle(t *testing.T) {
 	if h.Get("Cache-Control") != "no-store" {
 		t.Fatal("refresh may use stale cache", h)
 	}
-	if err := p.cmd.Process.Signal(os.Interrupt); err != nil {
+	if err := interruptPreviewProcess(p.cmd.Process); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -354,48 +357,245 @@ func TestPreviewDirectoryRename(t *testing.T) {
 	get(t, p.urls[0], 200, "original")
 }
 
-func TestConcurrentPageReplacementDoesNotExposeHiddenFile(t *testing.T) {
+func TestConcurrentReplacementDoesNotExposeHiddenFile(t *testing.T) {
+	for _, route := range []string{"", "chosen.html"} {
+		t.Run("/"+route, func(t *testing.T) {
+			dir, page := fixture(t)
+			hidden := filepath.Join(dir, ".secret.html")
+			if err := os.WriteFile(hidden, []byte("secret"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			p := start(t, dir, page)
+			// Separate staging names prevent a failed rename from leaving a symlink
+			// that a later WriteFile could follow and overwrite the hidden marker.
+			swapLink := filepath.Join(dir, "swap-link")
+			swapFile := filepath.Join(dir, "swap-file")
+			symlink(t, ".secret.html", swapLink)
+			if err := os.Remove(swapLink); err != nil {
+				t.Fatal(err)
+			}
+			stop := make(chan struct{})
+			type replacements struct {
+				hidden, public int
+				lastError      error
+			}
+			done := make(chan replacements, 1)
+			go func() {
+				result := replacements{}
+				defer func() { done <- result }()
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					if err := os.Symlink(".secret.html", swapLink); err != nil {
+						result.lastError = err
+					} else if err := os.Rename(swapLink, page); err != nil {
+						result.lastError = err
+					} else {
+						result.hidden++
+					}
+					if err := os.Remove(swapLink); err != nil && !os.IsNotExist(err) {
+						result.lastError = err
+					}
+					if err := os.WriteFile(swapFile, []byte("public"), 0600); err != nil {
+						result.lastError = err
+					} else if err := os.Rename(swapFile, page); err != nil {
+						result.lastError = err
+					} else {
+						result.public++
+					}
+				}
+			}()
+			defer func() {
+				close(stop)
+				result := <-done
+				if result.hidden == 0 || result.public == 0 {
+					t.Errorf("confinement replacements were not exercised: hidden=%d public=%d last error=%v", result.hidden, result.public, result.lastError)
+				} else if result.lastError != nil {
+					t.Logf("concurrent replacement encountered transient filesystem error: %v", result.lastError)
+				}
+			}()
+			for i := 0; i < 200; i++ {
+				res, err := client.Get(p.urls[0] + route)
+				if err != nil {
+					t.Fatal(err)
+				}
+				data, err := io.ReadAll(res.Body)
+				res.Body.Close()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if res.StatusCode != 200 && res.StatusCode != 404 {
+					t.Fatalf("unexpected status %d", res.StatusCode)
+				}
+				if strings.Contains(string(data), "secret") {
+					t.Fatal("exposed hidden preview page")
+				}
+			}
+		})
+	}
+}
+
+func TestPreviewAssetsAndRefresh(t *testing.T) {
 	dir, page := fixture(t)
-	hidden := filepath.Join(dir, ".secret.html")
-	if err := os.WriteFile(hidden, []byte("secret"), 0600); err != nil {
+	writeFile(t, filepath.Join(dir, "style.css"), "body { color: red; }")
+	p := start(t, t.TempDir(), page)
+	h := get(t, p.urls[0]+"style.css", 200, "body { color: red; }")
+	if !strings.HasPrefix(h.Get("Content-Type"), "text/css") || h.Get("Cache-Control") != "no-store" {
+		t.Fatal(h)
+	}
+	writeFile(t, filepath.Join(dir, "style.css"), "body { color: blue; }")
+	get(t, p.urls[0]+"style.css", 200, "body { color: blue; }")
+}
+
+func writeFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNestedAndUnreferencedPreviewAssets(t *testing.T) {
+	dir, page := fixture(t)
+	files := []struct{ path, body, contentType string }{
+		{"assets/theme.css", "h1 { color: green; }", "text/css"},
+		{"app.js", "document.title = 'preview';", "text/javascript"},
+		{"assets/icon.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>", "image/svg+xml"},
+		{"assets/font.woff2", "wOF2", "font/woff2"},
+		{"unreferenced.txt", "neighbor", "text/plain"},
+		{"assets/space name.txt", "space", "text/plain"},
+	}
+	for _, file := range files {
+		writeFile(t, filepath.Join(dir, file.path), file.body)
+	}
+	p := start(t, t.TempDir(), page)
+	for _, file := range files {
+		t.Run(file.path, func(t *testing.T) {
+			h := get(t, p.urls[0]+file.path, 200, file.body)
+			typ, _, err := mime.ParseMediaType(h.Get("Content-Type"))
+			if err != nil || (typ != file.contentType && !(file.path == "app.js" && typ == "application/javascript")) {
+				t.Fatal(h)
+			}
+			if h.Get("Cache-Control") != "no-store" {
+				t.Fatal(h)
+			}
+		})
+	}
+	for _, path := range []string{"assets", "assets/", "missing", "missing.html", "assets/missing.css"} {
+		get(t, p.urls[0]+path, 404, "404 page not found\n")
+	}
+}
+
+func symlink(t *testing.T, target, path string) {
+	t.Helper()
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatalf("confinement test requires symlinks (on Windows enable Developer Mode or run elevated): %v", err)
+	}
+}
+
+func TestPreviewAssetBoundary(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "preview")
+	page := filepath.Join(dir, "chosen.html")
+	writeFile(t, page, "public")
+	writeFile(t, filepath.Join(parent, "outside.txt"), "OUTSIDE MARKER")
+	writeFile(t, filepath.Join(dir, ".secret"), "HIDDEN MARKER")
+	writeFile(t, filepath.Join(dir, ".hidden", "secret.txt"), "HIDDEN MARKER")
+	writeFile(t, filepath.Join(dir, "nested", "public.txt"), "public asset")
+	symlink(t, "../outside.txt", filepath.Join(dir, "escape.txt"))
+	symlink(t, parent, filepath.Join(dir, "escape-dir"))
+	symlink(t, ".secret", filepath.Join(dir, "hidden-alias"))
+	symlink(t, ".hidden", filepath.Join(dir, "hidden-dir"))
+	symlink(t, "nested/public.txt", filepath.Join(dir, "alias.txt"))
+	symlink(t, "../alias.txt", filepath.Join(dir, "nested", "alias.txt"))
+	// The hidden component must be checked before cleaning the symlink target.
+	symlink(t, ".hidden/../nested/public.txt", filepath.Join(dir, "hidden-hop.txt"))
+	p := start(t, t.TempDir(), page)
+	for _, path := range []string{
+		".secret", "%2esecret", ".hidden/secret.txt", "%2ehidden/secret.txt",
+		"../outside.txt", "%2e%2e/outside.txt", "%2e%2e%2foutside.txt",
+		"nested/../../outside.txt", "nested/%2e%2e/%2e%2e/outside.txt",
+		"%252e%252e/outside.txt", "..%5coutside.txt", "%2f../outside.txt",
+		"nested/./public.txt", "nested//public.txt", "nested/%00public.txt",
+		"C:%5cWindows%5cwin.ini", "chosen.html::$DATA",
+		"escape.txt", "escape-dir/outside.txt", "hidden-alias", "hidden-dir/secret.txt", "hidden-hop.txt",
+	} {
+		t.Run(path, func(t *testing.T) { get(t, p.urls[0]+path, 404, "404 page not found\n") })
+	}
+	get(t, p.urls[0]+"alias.txt", 200, "public asset")
+	get(t, p.urls[0]+"nested/alias.txt", 200, "public asset")
+}
+
+func TestPreviewAssetTargetsChangeWhileRunning(t *testing.T) {
+	dir, page := fixture(t)
+	outside := t.TempDir()
+	writeFile(t, filepath.Join(outside, "asset.txt"), "OUTSIDE MARKER")
+	writeFile(t, filepath.Join(dir, ".hidden", "asset.txt"), "HIDDEN MARKER")
+	writeFile(t, filepath.Join(dir, "public", "asset.txt"), "public asset")
+	alias := filepath.Join(dir, "alias")
+	symlink(t, "public", alias)
+	p := start(t, t.TempDir(), page)
+	get(t, p.urls[0]+"alias/asset.txt", 200, "public asset")
+	for _, target := range []string{outside, ".hidden", "public"} {
+		if err := os.Remove(alias); err != nil {
+			t.Fatal(err)
+		}
+		symlink(t, target, alias)
+		status, body := 404, "404 page not found\n"
+		if target == "public" {
+			status, body = 200, "public asset"
+		}
+		get(t, p.urls[0]+"alias/asset.txt", status, body)
+	}
+	// Replace the target itself, leaving the alias unchanged.
+	asset := filepath.Join(dir, "public", "asset.txt")
+	for _, target := range []string{filepath.Join(outside, "asset.txt"), filepath.Join(dir, ".hidden", "asset.txt")} {
+		if err := os.Remove(asset); err != nil {
+			t.Fatal(err)
+		}
+		symlink(t, target, asset)
+		get(t, p.urls[0]+"alias/asset.txt", 404, "404 page not found\n")
+	}
+	if err := os.Remove(asset); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, asset, "restored")
+	get(t, p.urls[0]+"alias/asset.txt", 200, "restored")
+	// A real directory can also be replaced with a link during the preview.
+	if err := os.Rename(filepath.Join(dir, "public"), filepath.Join(dir, "moved")); err != nil {
+		t.Fatal(err)
+	}
+	symlink(t, outside, filepath.Join(dir, "public"))
+	get(t, p.urls[0]+"alias/asset.txt", 404, "404 page not found\n")
+}
+
+func TestRefreshIgnoresConditionalDates(t *testing.T) {
+	dir, page := fixture(t)
+	asset := filepath.Join(dir, "style.css")
+	writeFile(t, asset, "body { color: red; }")
 	p := start(t, dir, page)
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			swap := filepath.Join(dir, "swap")
-			if os.Symlink(".secret.html", swap) == nil {
-				os.Rename(swap, page)
-			}
-			if os.WriteFile(swap, []byte("public"), 0600) == nil {
-				os.Rename(swap, page)
-			}
-		}
-	}()
-	defer func() { close(stop); <-done }()
-	for i := 0; i < 200; i++ {
-		res, err := client.Get(p.urls[0])
+	get(t, p.urls[0]+"style.css", 200, "body { color: red; }")
+	writeFile(t, asset, "body { color: blue; }")
+	writeFile(t, page, "<h1>edited</h1>")
+	for path, want := range map[string]string{"": "<h1>edited</h1>", "style.css": "body { color: blue; }"} {
+		req, err := http.NewRequest(http.MethodGet, p.urls[0]+path, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		data, err := io.ReadAll(res.Body)
+		req.Header.Set("If-Modified-Since", time.Now().Add(time.Hour).UTC().Format(http.TimeFormat))
+		res, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(res.Body)
 		res.Body.Close()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if res.StatusCode != 200 && res.StatusCode != 404 {
-			t.Fatalf("unexpected status %d", res.StatusCode)
-		}
-		if strings.Contains(string(data), "secret") {
-			t.Fatal("exposed hidden preview page")
+		if err != nil || res.StatusCode != 200 || string(body) != want || res.Header.Get("Cache-Control") != "no-store" {
+			t.Fatalf("refresh %s: status %d, body %q, headers %v, error %v", path, res.StatusCode, body, res.Header, err)
 		}
 	}
 }

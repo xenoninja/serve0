@@ -2,12 +2,15 @@ package main
 
 import (
 	"fmt"
-	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 )
 
 func main() {
@@ -27,7 +30,8 @@ An omitted port or zero lets the OS allocate an available port.
 An explicit port (1-65535) must be available; binding errors are fatal.
 HTTP listens on all IPv4 interfaces without authentication.
 Printed URLs are candidates; firewall and routing determine reachability.
-Only the root preview URL is served. Press Ctrl+C to stop.
+Ordinary files in the preview directory are available by known URL.
+Directory listings and hidden paths are disabled. Press Ctrl+C to stop.
 `)
 		return nil
 	}
@@ -53,20 +57,28 @@ Only the root preview URL is served. Press Ctrl+C to stop.
 	defer listener.Close()
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
+		name := page.name
 		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
+			name = strings.TrimPrefix(r.URL.Path, "/")
+			// URL.Path is already decoded. Reject ambiguous paths before any cleaning.
+			if !fs.ValidPath(name) || strings.ContainsAny(name, "\\:") {
+				http.NotFound(w, r)
+				return
+			}
+			name = filepath.FromSlash(name)
 		}
-		f, err := page.open()
+		f, err := page.openPath(name, 0)
 		if err != nil {
 			http.NotFound(w, r)
 			return
 		}
 		defer f.Close()
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if r.Method != http.MethodHead {
-			io.Copy(w, f)
+		if r.URL.Path == "/" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		}
+		// A zero modification time disables conditional date responses: even edits
+		// within one second must be visible on an ordinary browser refresh.
+		http.ServeContent(w, r, name, time.Time{}, f)
 	})}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
