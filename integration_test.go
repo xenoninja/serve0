@@ -540,6 +540,51 @@ func TestPreviewAssetBoundary(t *testing.T) {
 	get(t, p.urls[0]+"nested/alias.txt", 200, "public asset")
 }
 
+func TestSymlinkParentResolution(t *testing.T) {
+	for _, absolute := range []bool{false, true} {
+		t.Run(fmt.Sprintf("absolute=%t", absolute), func(t *testing.T) {
+			dir, page := fixture(t)
+			writeFile(t, filepath.Join(dir, "nested", "child", "placeholder"), "")
+			writeFile(t, filepath.Join(dir, "nested", "asset.html"), "correct preview")
+			writeFile(t, filepath.Join(dir, "asset.html"), "wrong preview")
+			symlink(t, filepath.Join("nested", "child"), filepath.Join(dir, "jump"))
+			// Join would erase the parent component that this test exercises.
+			target := "jump" + string(filepath.Separator) + ".." + string(filepath.Separator) + "asset.html"
+			if absolute {
+				target = dir + string(filepath.Separator) + target
+			}
+			alias := filepath.Join(dir, "alias.html")
+			symlink(t, target, alias)
+			p := start(t, dir, page)
+			get(t, p.urls[0]+"alias.html", 200, "correct preview")
+			selected := start(t, dir, alias)
+			get(t, selected.urls[0], 200, "correct preview")
+			symlink(t, dir, filepath.Join(dir, "directory-alias"))
+			get(t, p.urls[0]+"directory-alias/alias.html", 200, "correct preview")
+
+			// A parent component must not erase a prohibited or missing hop.
+			outside := t.TempDir()
+			writeFile(t, filepath.Join(outside, "child", "placeholder"), "")
+			writeFile(t, filepath.Join(outside, "asset.html"), "outside preview")
+			writeFile(t, filepath.Join(dir, ".hidden", "child", "placeholder"), "")
+			writeFile(t, filepath.Join(dir, ".hidden", "asset.html"), "hidden preview")
+			for _, destination := range []string{
+				filepath.Join(outside, "child"),
+				filepath.Join(".hidden", "child"),
+				"missing",
+				"..",
+			} {
+				if err := os.Remove(filepath.Join(dir, "jump")); err != nil {
+					t.Fatal(err)
+				}
+				symlink(t, destination, filepath.Join(dir, "jump"))
+				get(t, p.urls[0]+"alias.html", 404, "404 page not found\n")
+				get(t, selected.urls[0], 404, "404 page not found\n")
+			}
+		})
+	}
+}
+
 func TestPreviewAssetTargetsChangeWhileRunning(t *testing.T) {
 	dir, page := fixture(t)
 	outside := t.TempDir()

@@ -105,7 +105,7 @@ Directory listings and hidden paths are disabled. Press Ctrl+C to stop.
 			}
 			name = filepath.FromSlash(name)
 		}
-		f, err := page.openPath(name, 0)
+		f, err := page.openPath(name)
 		if err != nil {
 			http.NotFound(w, r)
 			return
