@@ -1,0 +1,401 @@
+package main_test
+
+import (
+	"bufio"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+var binary string
+
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "serve0-test-")
+	if err != nil {
+		panic(err)
+	}
+	binary = filepath.Join(dir, "serve0")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: %v\n", output, err)
+		os.RemoveAll(dir)
+		os.Exit(1)
+	}
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+type preview struct {
+	cmd     *exec.Cmd
+	done    chan error
+	urls    []string
+	stopped bool
+}
+
+func start(t *testing.T, dir string, args ...string) *preview {
+	t.Helper()
+	cmd := exec.Command(binary, args...)
+	cmd.Dir = dir
+	pipe, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	p := &preview{cmd: cmd, done: make(chan error, 1)}
+	lines := make(chan string, 64)
+	go func() {
+		scanner := bufio.NewScanner(pipe)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	go func() { p.done <- cmd.Wait() }()
+	t.Cleanup(func() {
+		if !p.stopped {
+			cmd.Process.Kill()
+			select {
+			case <-p.done:
+			case <-time.After(5 * time.Second):
+				t.Error("process did not exit")
+			}
+		}
+	})
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				t.Fatal("startup ended without ready message")
+			}
+			if strings.HasPrefix(line, "http://") {
+				p.urls = append(p.urls, line)
+			}
+			if strings.Contains(line, "Ctrl+C") {
+				if len(p.urls) == 0 {
+					t.Fatal("no URLs")
+				}
+				return p
+			}
+		case <-timer.C:
+			t.Fatal("startup timed out")
+		}
+	}
+}
+
+func fixture(t *testing.T) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	page := filepath.Join(dir, "chosen.html")
+	if err := os.WriteFile(page, []byte("<h1>chosen</h1>"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return dir, page
+}
+
+var client = &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{Proxy: nil}}
+
+func get(t *testing.T, url string, status int, body string) http.Header {
+	t.Helper()
+	res, err := client.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != status || (body != "" && string(data) != body) {
+		t.Fatalf("GET %s: %d %q", url, res.StatusCode, data)
+	}
+	return res.Header
+}
+func TestPreviewLifecycle(t *testing.T) {
+	dir, page := fixture(t)
+	p := start(t, dir, filepath.Base(page))
+	h := get(t, p.urls[0], 200, "<h1>chosen</h1>")
+	if !strings.HasPrefix(h.Get("Content-Type"), "text/html") {
+		t.Fatal(h)
+	}
+	get(t, p.urls[0]+"chosen.html", 404, "")
+	if err := os.WriteFile(page, []byte("<h1>edited</h1>"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	get(t, p.urls[0], 200, "<h1>edited</h1>")
+	if h.Get("Cache-Control") != "no-store" {
+		t.Fatal("refresh may use stale cache", h)
+	}
+	if err := p.cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-p.done:
+		p.stopped = true
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown timed out")
+	}
+	address := strings.TrimSuffix(strings.TrimPrefix(p.urls[0], "http://"), "/")
+	conn, err := net.DialTimeout("tcp4", address, time.Second)
+	if err == nil {
+		conn.Close()
+		t.Fatal("listener survived shutdown")
+	}
+}
+
+func invoke(t *testing.T, dir string, success bool, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(binary, args...)
+	cmd.Dir = dir
+	var output strings.Builder
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if (err == nil) != success {
+			t.Fatalf("args %q: %v: %s", args, err, output.String())
+		}
+	case <-time.After(5 * time.Second):
+		cmd.Process.Kill()
+		<-done
+		t.Fatalf("args %q did not exit", args)
+	}
+	if !success && (strings.Contains(output.String(), "http://") || strings.TrimSpace(output.String()) == "") {
+		t.Fatalf("bad diagnostic: %s", output.String())
+	}
+	return output.String()
+}
+
+func TestInvalidInvocationsAndHelp(t *testing.T) {
+	dir, page := fixture(t)
+	for _, args := range [][]string{nil, {"missing.html"}, {dir}, {page, "-1"}, {page, "65536"}, {page, "1.5"}, {page, "abc"}, {page, "0", "extra"}} {
+		t.Run(fmt.Sprint(args), func(t *testing.T) { invoke(t, dir, false, args...) })
+	}
+	for _, flag := range []string{"-h", "--help"} {
+		out := invoke(t, dir, true, flag)
+		for _, word := range []string{"[port]", "zero", "Ctrl+C", "root", "foreground"} {
+			if !strings.Contains(out, word) {
+				t.Errorf("help missing %q: %s", word, out)
+			}
+		}
+	}
+}
+
+func TestSelectedPageBoundary(t *testing.T) {
+	dir, page := fixture(t)
+	hidden := filepath.Join(dir, ".secret.html")
+	if err := os.WriteFile(hidden, []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	invoke(t, dir, false, hidden)
+	outside := filepath.Join(t.TempDir(), "outside.html")
+	if err := os.WriteFile(outside, []byte("outside"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.html")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	invoke(t, dir, false, link)
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(hidden, link); err != nil {
+		t.Fatal(err)
+	}
+	invoke(t, dir, false, link)
+	p := start(t, dir, page, "0")
+	for _, target := range []string{outside, hidden} {
+		if err := os.Remove(page); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, page); err != nil {
+			t.Fatal(err)
+		}
+		get(t, p.urls[0], 404, "")
+	}
+	if err := os.Remove(page); err != nil {
+		t.Fatal(err)
+	}
+	get(t, p.urls[0], 404, "")
+	if err := os.Mkdir(page, 0700); err != nil {
+		t.Fatal(err)
+	}
+	get(t, p.urls[0], 404, "")
+}
+
+func TestPortsAndAddresses(t *testing.T) {
+	dir, page := fixture(t)
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := map[string]bool{}
+	for _, address := range addresses {
+		ip, _, err := net.ParseCIDR(address.String())
+		if err == nil && ip.To4() != nil {
+			local[ip.String()] = true
+		}
+	}
+	for _, port := range []string{"0", "explicit"} {
+		t.Run(port, func(t *testing.T) {
+			requested := port
+			if port == "explicit" {
+				l, err := net.Listen("tcp4", "0.0.0.0:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				requested = fmt.Sprint(l.Addr().(*net.TCPAddr).Port)
+				l.Close()
+			}
+			p := start(t, dir, page, requested)
+			connectedNonLoopback := false
+			for _, url := range p.urls {
+				address := strings.TrimSuffix(strings.TrimPrefix(url, "http://"), "/")
+				host, actual, err := net.SplitHostPort(address)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !local[host] || net.ParseIP(host).IsUnspecified() || actual == "0" {
+					t.Fatalf("invalid candidate %s", url)
+				}
+				if port == "explicit" && actual != requested {
+					t.Fatalf("port %s, want %s", actual, requested)
+				}
+				get(t, url, 200, "<h1>chosen</h1>")
+				if !net.ParseIP(host).IsLoopback() {
+					connectedNonLoopback = true
+				}
+			}
+			if !connectedNonLoopback {
+				t.Log("no non-loopback IPv4 candidate available")
+			}
+		})
+	}
+	held, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	port := fmt.Sprint(held.Addr().(*net.TCPAddr).Port)
+	output := invoke(t, dir, false, page, port)
+	if !strings.Contains(output, "bind") && !strings.Contains(output, "listen") {
+		t.Fatal(output)
+	}
+	held.Close()
+	rebound, err := net.Listen("tcp4", ":"+port)
+	if err != nil {
+		t.Fatalf("failed start retained listener: %v", err)
+	}
+	rebound.Close()
+}
+
+func TestReadablePageAndInternalSymlink(t *testing.T) {
+	dir, page := fixture(t)
+	link := filepath.Join(dir, "alias.html")
+	if err := os.Symlink(page, link); err != nil {
+		t.Fatal(err)
+	}
+	p := start(t, dir, link)
+	get(t, p.urls[0], 200, "<h1>chosen</h1>")
+	if err := os.Chmod(page, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(page, 0600)
+	if f, err := os.Open(page); err == nil {
+		f.Close()
+		t.Skip("environment can read mode-000 files")
+	}
+	invoke(t, dir, false, page)
+	get(t, p.urls[0], 404, "")
+}
+
+func TestPreviewDirectoryRename(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "preview")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	page := filepath.Join(dir, "page.html")
+	if err := os.WriteFile(page, []byte("original"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := start(t, parent, page)
+	if err := os.Rename(dir, dir+"-moved"); err != nil {
+		t.Fatal(err)
+	}
+	get(t, p.urls[0], 200, "original")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(page, []byte("replacement"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	get(t, p.urls[0], 200, "original")
+}
+
+func TestConcurrentPageReplacementDoesNotExposeHiddenFile(t *testing.T) {
+	dir, page := fixture(t)
+	hidden := filepath.Join(dir, ".secret.html")
+	if err := os.WriteFile(hidden, []byte("secret"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := start(t, dir, page)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			swap := filepath.Join(dir, "swap")
+			if os.Symlink(".secret.html", swap) == nil {
+				os.Rename(swap, page)
+			}
+			if os.WriteFile(swap, []byte("public"), 0600) == nil {
+				os.Rename(swap, page)
+			}
+		}
+	}()
+	defer func() { close(stop); <-done }()
+	for i := 0; i < 200; i++ {
+		res, err := client.Get(p.urls[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(res.Body)
+		res.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.StatusCode != 200 && res.StatusCode != 404 {
+			t.Fatalf("unexpected status %d", res.StatusCode)
+		}
+		if strings.Contains(string(data), "secret") {
+			t.Fatal("exposed hidden preview page")
+		}
+	}
+}
