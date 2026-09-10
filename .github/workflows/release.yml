@@ -1,0 +1,98 @@
+name: Build and verify
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+      - name: Select version
+        shell: bash
+        run: |
+          version="v0.0.0-dev.$GITHUB_SHA"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then version="${GITHUB_REF#refs/tags/}"; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - run: go vet ./...
+      - name: Package all targets and check reproducibility
+        run: |
+          go run ./cmd/package -version "$VERSION" -out dist
+          go run ./cmd/package -version "$VERSION" -out repeated
+          diff dist/SHA256SUMS repeated/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/*
+          if-no-files-found: error
+
+  native:
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux_amd64
+            executable: serve0
+          - runner: macos-14
+            target: darwin_arm64
+            executable: serve0
+          - runner: windows-2022
+            target: windows_amd64
+            executable: serve0.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+      - name: Verify direct build
+        run: go test -count=1 -v ./...
+      - name: Install and verify
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/installed"
+          GOBIN="$RUNNER_TEMP/installed" go install .
+          SERVE0_TEST_BINARY="$RUNNER_TEMP/installed/${{ matrix.executable }}" go test -count=1 -v .
+      - name: Extract and verify package
+        shell: pwsh
+        run: |
+          $archive = Get-ChildItem "dist/*_${{ matrix.target }}.zip"
+          Expand-Archive $archive.FullName -DestinationPath packaged
+          if (!$IsWindows) { chmod +x packaged/serve0 }
+          $env:SERVE0_TEST_BINARY = (Resolve-Path "packaged/${{ matrix.executable }}").Path
+          $env:SERVE0_TEST_VERSION = ($archive.Name -replace '^serve0_', '' -replace '_${{ matrix.target }}.zip$', '')
+          go test -count=1 -v .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package, native]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+      - name: Publish draft release for review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --draft --title "$RELEASE_TAG" --generate-notes

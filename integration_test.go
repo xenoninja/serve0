@@ -25,6 +25,15 @@ func TestMain(m *testing.M) {
 	// Keep the executable discoverable through PATHEXT on Windows.
 	binary = filepath.Join(dir, "serve0.exe")
 	build := exec.Command("go", "build", "-o", binary, ".")
+	if supplied := os.Getenv("SERVE0_TEST_BINARY"); supplied != "" {
+		binary, err = filepath.Abs(supplied)
+		if err != nil {
+			panic(err)
+		}
+		code := m.Run()
+		os.RemoveAll(dir)
+		os.Exit(code)
+	}
 	if output, err := build.CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", output, err)
 		os.RemoveAll(dir)
@@ -597,5 +606,19 @@ func TestRefreshIgnoresConditionalDates(t *testing.T) {
 		if err != nil || res.StatusCode != 200 || string(body) != want || res.Header.Get("Cache-Control") != "no-store" {
 			t.Fatalf("refresh %s: status %d, body %q, headers %v, error %v", path, res.StatusCode, body, res.Header, err)
 		}
+	}
+}
+
+func TestVersionWithoutPreviewPage(t *testing.T) {
+	out := invoke(t, t.TempDir(), true, "--version")
+	if !strings.HasPrefix(out, "serve0 ") || len(strings.Fields(out)) < 2 || strings.Contains(out, "http://") {
+		t.Fatalf("invalid version output: %q", out)
+	}
+	if want := os.Getenv("SERVE0_TEST_VERSION"); want != "" && strings.TrimSpace(out) != "serve0 "+want {
+		t.Fatalf("version %q, want %q", out, want)
+	}
+	help := invoke(t, t.TempDir(), true, "--help")
+	if !strings.Contains(help, "--version") || !strings.Contains(help, "--help") {
+		t.Fatalf("help missing command flags: %s", help)
 	}
 }
