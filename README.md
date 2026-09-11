@@ -63,6 +63,11 @@ Run the CLI/HTTP integration tests with `go test ./...` and static checks with
 `go vet ./...`. Tests build the executable, use temporary fixtures and dynamically
 allocated ports, and require permission to open local listening sockets.
 
+The root `main.go` handles process exit and build identification; preview command
+implementation lives in `internal/app/`. Executable integration tests and their
+platform-specific process helpers live in `tests/integration/`; release packaging
+lives in `cmd/package/`. Root build and installation commands remain the same.
+
 Confinement tests require symlink creation on each supported platform (Linux,
 macOS, and Windows); failures are reported rather than skipped. On Windows,
 enable Developer Mode or run the tests with permission to create symlinks.

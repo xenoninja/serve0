@@ -1,4 +1,4 @@
-package main_test
+package integration_test
 
 import (
 	"bufio"
@@ -25,7 +25,12 @@ func TestMain(m *testing.M) {
 	// Keep the executable discoverable through PATHEXT on Windows.
 	binary = filepath.Join(dir, "serve0.exe")
 	build := exec.Command("go", "build", "-o", binary, ".")
+	build.Dir = filepath.Join("..", "..")
 	if supplied := os.Getenv("SERVE0_TEST_BINARY"); supplied != "" {
+		// Resolve relative overrides from the repository root, as before relocation.
+		if !filepath.IsAbs(supplied) {
+			supplied = filepath.Join(build.Dir, supplied)
+		}
 		binary, err = filepath.Abs(supplied)
 		if err != nil {
 			panic(err)

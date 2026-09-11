@@ -67,7 +67,7 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/installed"
           GOBIN="$RUNNER_TEMP/installed" go install .
-          SERVE0_TEST_BINARY="$RUNNER_TEMP/installed/${{ matrix.executable }}" go test -count=1 -v .
+          SERVE0_TEST_BINARY="$RUNNER_TEMP/installed/${{ matrix.executable }}" go test -count=1 -v ./tests/integration
       - name: Extract and verify package
         shell: pwsh
         run: |
@@ -76,7 +76,7 @@ jobs:
           if (!$IsWindows) { chmod +x packaged/serve0 }
           $env:SERVE0_TEST_BINARY = (Resolve-Path "packaged/${{ matrix.executable }}").Path
           $env:SERVE0_TEST_VERSION = ($archive.Name -replace '^serve0_', '' -replace '_${{ matrix.target }}.zip$', '')
-          go test -count=1 -v .
+          go test -count=1 -v ./tests/integration
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   release:
