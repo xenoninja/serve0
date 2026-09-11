@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -358,6 +359,14 @@ func TestPreviewDirectoryRename(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := start(t, parent, page)
+	if runtime.GOOS == "windows" {
+		// os.OpenRoot holds a Windows handle without FILE_SHARE_DELETE.
+		if err := os.Rename(dir, dir+"-moved"); err == nil {
+			t.Fatal("renamed an open preview directory on Windows")
+		}
+		get(t, p.urls[0], 200, "original")
+		return
+	}
 	if err := os.Rename(dir, dir+"-moved"); err != nil {
 		t.Fatal(err)
 	}
@@ -369,6 +378,23 @@ func TestPreviewDirectoryRename(t *testing.T) {
 		t.Fatal(err)
 	}
 	get(t, p.urls[0], 200, "original")
+}
+
+func TestAbsoluteSymlinksThroughDirectoryAlias(t *testing.T) {
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "preview")
+	writeFile(t, filepath.Join(dir, "chosen.html"), "chosen preview")
+	alias := filepath.Join(parent, "directory-alias")
+	symlink(t, dir, alias)
+	symlink(t, filepath.Join(alias, "chosen.html"), filepath.Join(dir, "page-alias.html"))
+	symlink(t, alias, filepath.Join(dir, "self"))
+	for _, selectedDir := range []string{dir, alias} {
+		t.Run(filepath.Base(selectedDir), func(t *testing.T) {
+			p := start(t, parent, filepath.Join(selectedDir, "page-alias.html"))
+			get(t, p.urls[0], 200, "chosen preview")
+			get(t, p.urls[0]+"self/page-alias.html", 200, "chosen preview")
+		})
+	}
 }
 
 func TestConcurrentReplacementDoesNotExposeHiddenFile(t *testing.T) {

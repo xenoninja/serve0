@@ -4,14 +4,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
 
 // previewPage retains the preview directory even if its original pathname changes.
 type previewPage struct {
-	root            *os.Root
-	directory, name string
+	root *os.Root
+	name string
 }
 
 func selectPage(path string) (*previewPage, error) {
@@ -27,7 +26,7 @@ func selectPage(path string) (*previewPage, error) {
 	if err != nil {
 		return nil, err
 	}
-	page := &previewPage{root: root, directory: directory, name: filepath.Base(absolute)}
+	page := &previewPage{root: root, name: filepath.Base(absolute)}
 	f, err := page.open()
 	if err != nil {
 		root.Close()
@@ -125,18 +124,11 @@ func (p *previewPage) openPath(path string) (*os.File, error) {
 func (p *previewPage) pathParts(path string) ([]string, error) {
 	path = filepath.FromSlash(path)
 	if filepath.IsAbs(path) {
-		if path == p.directory || (runtime.GOOS == "windows" && strings.EqualFold(path, p.directory)) {
-			return []string{"."}, nil
+		var err error
+		path, err = p.relativeTarget(path)
+		if err != nil {
+			return nil, err
 		}
-		prefix := strings.TrimRight(p.directory, string(filepath.Separator)) + string(filepath.Separator)
-		inside := strings.HasPrefix(path, prefix)
-		if runtime.GOOS == "windows" && len(path) >= len(prefix) {
-			inside = strings.EqualFold(path[:len(prefix)], prefix)
-		}
-		if !inside {
-			return nil, fmt.Errorf("page is outside the preview directory")
-		}
-		path = path[len(prefix):]
 	} else if filepath.VolumeName(path) != "" || strings.HasPrefix(path, string(filepath.Separator)) {
 		return nil, fmt.Errorf("page is outside the preview directory")
 	}
@@ -150,6 +142,30 @@ func (p *previewPage) pathParts(path string) ([]string, error) {
 		}
 	}
 	return parts, nil
+}
+
+// Find the first prefix naming the held preview directory. Directory identity
+// handles symlink aliases and Windows short names without cleaning the remaining
+// target: hidden components and symlink/.. hops still go through openPath.
+func (p *previewPage) relativeTarget(path string) (string, error) {
+	rootInfo, err := p.root.Stat(".")
+	if err != nil {
+		return "", err
+	}
+	start := len(filepath.VolumeName(path)) + 1
+	for end := start; end <= len(path); end++ {
+		if end != start && end != len(path) && path[end] != filepath.Separator {
+			continue
+		}
+		info, err := os.Stat(path[:end])
+		if err != nil {
+			return "", err
+		}
+		if os.SameFile(rootInfo, info) {
+			return strings.TrimPrefix(path[end:], string(filepath.Separator)), nil
+		}
+	}
+	return "", fmt.Errorf("page is outside the preview directory")
 }
 
 func hiddenPath(path string) bool {
