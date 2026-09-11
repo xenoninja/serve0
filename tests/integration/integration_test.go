@@ -585,7 +585,25 @@ func TestSymlinkParentResolution(t *testing.T) {
 				target = dir + string(filepath.Separator) + target
 			}
 			alias := filepath.Join(dir, "alias.html")
-			symlink(t, target, alias)
+			// os.Symlink uses CreateSymbolicLinkW on Windows, which cleans
+			// absolute targets before storing them. Root.Symlink preserves
+			// jump/.. so this fixture exercises the resolver on every platform.
+			root, err := os.OpenRoot(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = root.Symlink(target, "alias.html")
+			root.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored, err := os.Readlink(alias)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored != target {
+				t.Fatalf("symlink fixture target = %q, want %q", stored, target)
+			}
 			p := start(t, dir, page)
 			get(t, p.urls[0]+"alias.html", 200, "correct preview")
 			selected := start(t, dir, alias)
